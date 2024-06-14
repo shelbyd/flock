@@ -1,0 +1,6 @@
+PUSH 3
+PUSH 5
+ADD
+DEBUG
+
+EXIT 0
