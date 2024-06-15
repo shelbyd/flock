@@ -173,7 +173,7 @@ async fn execute(program: Arc<Program>, mut state: ThreadState) -> eyre::Result<
         match op {
             OpCode::Push(v) => {
                 let v = state.get(v)?;
-                state.stack.push(v)
+                state.push(v)
             }
             OpCode::Store(addr, v) => {
                 let addr = state.get(addr)?;
@@ -183,23 +183,23 @@ async fn execute(program: Arc<Program>, mut state: ThreadState) -> eyre::Result<
             OpCode::Load(addr) => {
                 let addr = state.get(addr)?;
                 let v = state.read_memory(addr)?;
-                state.stack.push(v);
+                state.push(v);
             }
 
             OpCode::Add(a, b) => {
                 let a = state.get(a)?;
                 let b = state.get(b)?;
-                state.stack.push(a + b);
+                state.push(a + b);
             }
             OpCode::Sub(a, b) => {
                 let a = state.get(a)?;
                 let b = state.get(b)?;
-                state.stack.push(a - b);
+                state.push(a - b);
             }
             OpCode::Mul(a, b) => {
                 let a = state.get(a)?;
                 let b = state.get(b)?;
-                state.stack.push(a * b);
+                state.push(a * b);
             }
 
             OpCode::Jump(addr) => {
@@ -221,10 +221,10 @@ async fn execute(program: Arc<Program>, mut state: ThreadState) -> eyre::Result<
 
                 let mut fork_state = state.clone();
                 fork_state.jump_to(addr, &program)?;
-                fork_state.stack.push(0);
+                fork_state.push(0);
 
                 // TODO(shelbyd): Global task id.
-                state.stack.push(next_child_id);
+                state.push(next_child_id);
 
                 child_threads.insert(next_child_id, spawn_execute(&program, fork_state));
                 next_child_id += 1;
@@ -236,8 +236,9 @@ async fn execute(program: Arc<Program>, mut state: ThreadState) -> eyre::Result<
                     .ok_or_eyre(format!("Attempt to join unknown thread: {tid}"))?;
 
                 match handle.await?? {
+                    // TODO(shelbyd): Exit from child thread without join.
                     ThreadResult::Exit(e) => return Ok(ThreadResult::Exit(e)),
-                    ThreadResult::Finish(v) => state.stack.push(v),
+                    ThreadResult::Finish(v) => state.push(v),
                 }
             }
             OpCode::ThreadFinish(v) => return Ok(ThreadResult::Finish(state.get(v)?)),
@@ -303,6 +304,10 @@ impl ThreadState {
                 Ok(self.read_memory(addr)?)
             }
         }
+    }
+
+    fn push(&mut self, v: Word) {
+        self.stack.push(v);
     }
 
     fn read_memory(&self, addr: Word) -> eyre::Result<Word> {
