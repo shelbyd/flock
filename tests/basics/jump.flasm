@@ -1,0 +1,19 @@
+JUMP :factorial
+EXIT 1
+
+:factorial
+# TODO(shelbyd): ASM constants.
+STORE 0x10, 5
+
+PUSH 1
+
+:factorial_loop
+MUL $pop, $mem[0x10]
+
+SUB $mem[0x10], 1
+STORE 0x10, $peek
+JUMP_EQ $pop, 0, :done
+JUMP :factorial_loop
+
+:done
+ASSERT_EQ $pop, 120

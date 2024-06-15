@@ -1,0 +1,8 @@
+# Fork join, get result
+FORK :simple_return
+JOIN $pop
+ASSERT_EQ $pop, 42
+EXIT 0
+
+:simple_return
+THREAD_FINISH 42

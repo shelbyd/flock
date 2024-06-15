@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+};
 
 use eyre::{Context, OptionExt};
 
@@ -17,33 +20,62 @@ pub async fn execute_at_path(path: &Path) -> eyre::Result<Word> {
 }
 
 fn parse(s: &str) -> eyre::Result<Program> {
-    let ops = s
+    let relevant_lines = s
         .lines()
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .filter(|s| !s.starts_with("#"))
-        .map(|line| {
-            let (command, args) = match line.split_once(" ") {
-                None => (line, Vec::new()),
-                Some((command, args)) => (command, args.split(", ").collect()),
-            };
+        .collect::<Vec<_>>();
 
-            Ok(match (command, &args[..]) {
-                ("PUSH", [v]) => OpCode::Push(v.parse()?),
-                ("STORE", [addr, v]) => OpCode::Store(addr.parse()?, v.parse()?),
-                ("LOAD", [addr]) => OpCode::Load(addr.parse()?),
+    let mut ops_seen = 0;
+    let mut labels = HashMap::new();
+    for line in &relevant_lines {
+        if let Some(label) = line.strip_prefix(":") {
+            let existing = labels.insert(label, ops_seen);
+            eyre::ensure!(existing.is_none(), "Duplicate label: {label}");
+        } else {
+            ops_seen += 1;
+        }
+    }
 
-                ("ADD", [a, b]) => OpCode::Add(a.parse()?, b.parse()?),
+    let parse = |s: &str| ValSp::parse(s, &labels);
 
-                ("EXIT", [v]) => OpCode::Exit(v.parse()?),
-                ("ASSERT_EQ", [a, b]) => OpCode::AssertEq(a.parse()?, b.parse()?),
+    let mut ops = Vec::new();
+    for line in relevant_lines {
+        if line.starts_with(":") {
+            continue;
+        }
 
-                ("DEBUG", []) => OpCode::Debug,
+        let (command, args) = match line.split_once(" ") {
+            None => (line, Vec::new()),
+            Some((command, args)) => (command, args.split(", ").collect()),
+        };
 
-                _ => eyre::bail!("Could not parse command: {line:?}"),
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        let op = match (command, &args[..]) {
+            ("PUSH", [v]) => OpCode::Push(parse(v)?),
+            ("STORE", [addr, v]) => OpCode::Store(parse(addr)?, parse(v)?),
+            ("LOAD", [addr]) => OpCode::Load(parse(addr)?),
+
+            ("ADD", [a, b]) => OpCode::Add(parse(a)?, parse(b)?),
+            ("SUB", [a, b]) => OpCode::Sub(parse(a)?, parse(b)?),
+            ("MUL", [a, b]) => OpCode::Mul(parse(a)?, parse(b)?),
+
+            ("JUMP", [addr]) => OpCode::Jump(parse(addr)?),
+            ("JUMP_EQ", [a, b, addr]) => OpCode::JumpEq(parse(a)?, parse(b)?, parse(addr)?),
+
+            ("FORK", [addr]) => OpCode::Fork(parse(addr)?),
+            ("JOIN", [id]) => OpCode::Join(parse(id)?),
+            ("THREAD_FINISH", [v]) => OpCode::ThreadFinish(parse(v)?),
+
+            ("EXIT", [v]) => OpCode::Exit(parse(v)?),
+            ("ASSERT_EQ", [a, b]) => OpCode::AssertEq(parse(a)?, parse(b)?),
+
+            ("DEBUG", []) => OpCode::Debug,
+
+            _ => eyre::bail!("Could not parse command: {line:?}"),
+        };
+        ops.push(op);
+    }
 
     Ok(Program { ops })
 }
@@ -60,6 +92,15 @@ enum OpCode {
     Load(ValSp),
 
     Add(ValSp, ValSp),
+    Sub(ValSp, ValSp),
+    Mul(ValSp, ValSp),
+
+    Jump(ValSp),
+    JumpEq(ValSp, ValSp, ValSp),
+
+    Fork(ValSp),
+    Join(ValSp),
+    ThreadFinish(ValSp),
 
     Exit(ValSp),
     AssertEq(ValSp, ValSp),
@@ -78,10 +119,16 @@ enum ValSp {
     Literal(Word),
 }
 
-impl std::str::FromStr for ValSp {
-    type Err = eyre::Report;
+impl ValSp {
+    fn parse(s: &str, labels: &HashMap<&str, u64>) -> eyre::Result<ValSp> {
+        if let Some(label) = s.strip_prefix(":") {
+            return Ok(ValSp::Literal(
+                *labels
+                    .get(label)
+                    .ok_or_eyre(format!("Unknown label: {label}"))?,
+            ));
+        }
 
-    fn from_str(s: &str) -> eyre::Result<ValSp> {
         if s == "$pop" {
             return Ok(ValSp::Pop);
         }
@@ -91,7 +138,7 @@ impl std::str::FromStr for ValSp {
         }
 
         if let Some(addr) = s.strip_prefix("$mem[").and_then(|s| s.strip_suffix("]")) {
-            return Ok(ValSp::Memory(Box::new(addr.parse()?)));
+            return Ok(ValSp::Memory(Box::new(ValSp::parse(addr, labels)?)));
         }
 
         Ok(ValSp::Literal(parse_literal(s)?))
@@ -112,9 +159,11 @@ fn parse_literal(s: &str) -> eyre::Result<Word> {
 }
 
 async fn execute(program: &Program) -> eyre::Result<Word> {
-    let mut state = State::new();
+    let mut state = ThreadState::new();
 
-    for op in &program.ops {
+    while let Some(op) = program.ops.get(state.instruction_pointer as usize) {
+        state.instruction_pointer += 1;
+
         match op {
             OpCode::Push(v) => {
                 let v = state.get(v)?;
@@ -136,14 +185,41 @@ async fn execute(program: &Program) -> eyre::Result<Word> {
                 let b = state.get(b)?;
                 state.stack.push(a + b);
             }
+            OpCode::Sub(a, b) => {
+                let a = state.get(a)?;
+                let b = state.get(b)?;
+                state.stack.push(a - b);
+            }
+            OpCode::Mul(a, b) => {
+                let a = state.get(a)?;
+                let b = state.get(b)?;
+                state.stack.push(a * b);
+            }
+
+            OpCode::Jump(addr) => {
+                let addr = state.get(addr)?;
+                state.jump_to(addr, &program)?;
+            }
+            OpCode::JumpEq(a, b, addr) => {
+                let a = state.get(a)?;
+                let b = state.get(b)?;
+                let addr = state.get(addr)?;
+
+                if a == b {
+                    state.jump_to(addr, &program)?;
+                }
+            }
+
+            OpCode::Fork(addr) => {
+                let addr = state.get(addr)?;
+                todo!();
+            }
 
             OpCode::Exit(code) => return Ok(state.get(code)?),
             OpCode::AssertEq(a, b) => {
                 let a = state.get(a)?;
                 let b = state.get(b)?;
-                if a != b {
-                    return Ok(1);
-                }
+                eyre::ensure!(a == b, "Expected {a} to equal {b}");
             }
 
             OpCode::Debug => {
@@ -164,16 +240,18 @@ async fn execute(program: &Program) -> eyre::Result<Word> {
 }
 
 #[derive(Debug)]
-struct State {
+struct ThreadState {
     stack: Vec<Word>,
     memory: BTreeMap<Word, Word>,
+    instruction_pointer: u64,
 }
 
-impl State {
+impl ThreadState {
     fn new() -> Self {
-        State {
+        ThreadState {
             stack: Default::default(),
             memory: Default::default(),
+            instruction_pointer: 0,
         }
     }
 
@@ -211,6 +289,17 @@ impl State {
     fn write_memory(&mut self, addr: Word, value: Word) -> eyre::Result<()> {
         let addr = self.aligned_local(addr)?;
         self.memory.insert(addr, value);
+        Ok(())
+    }
+
+    fn jump_to(&mut self, addr: Word, program: &Program) -> eyre::Result<()> {
+        eyre::ensure!(
+            (addr as usize) < program.ops.len(),
+            "Jump outside of program range: {addr} >= {}",
+            program.ops.len()
+        );
+        self.instruction_pointer = addr;
+
         Ok(())
     }
 }
