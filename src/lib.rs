@@ -1,9 +1,11 @@
 use std::{
     collections::{BTreeMap, HashMap},
     path::Path,
+    sync::Arc,
 };
 
 use eyre::{Context, OptionExt};
+use tokio::task::JoinHandle;
 
 pub type Word = u64;
 pub type Stack = Vec<Word>;
@@ -14,9 +16,12 @@ pub async fn execute_at_path(path: &Path) -> eyre::Result<Word> {
         .await
         .with_context(|| format!("Reading {}", path.display()))?;
 
-    let program = parse(&contents)?;
+    let program = Arc::new(parse(&contents)?);
 
-    Ok(execute(&program).await?)
+    match execute(program, ThreadState::new()).await? {
+        ThreadResult::Exit(code) => Ok(code),
+        ThreadResult::Finish(value) => Ok(value),
+    }
 }
 
 fn parse(s: &str) -> eyre::Result<Program> {
@@ -158,8 +163,9 @@ fn parse_literal(s: &str) -> eyre::Result<Word> {
     eyre::bail!("Could not parse as literal value: {s:?}")
 }
 
-async fn execute(program: &Program) -> eyre::Result<Word> {
-    let mut state = ThreadState::new();
+async fn execute(program: Arc<Program>, mut state: ThreadState) -> eyre::Result<ThreadResult> {
+    let mut child_threads = HashMap::new();
+    let mut next_child_id = 1;
 
     while let Some(op) = program.ops.get(state.instruction_pointer as usize) {
         state.instruction_pointer += 1;
@@ -212,10 +218,31 @@ async fn execute(program: &Program) -> eyre::Result<Word> {
 
             OpCode::Fork(addr) => {
                 let addr = state.get(addr)?;
-                todo!();
-            }
 
-            OpCode::Exit(code) => return Ok(state.get(code)?),
+                let mut fork_state = state.clone();
+                fork_state.jump_to(addr, &program)?;
+                fork_state.stack.push(0);
+
+                // TODO(shelbyd): Global task id.
+                state.stack.push(next_child_id);
+
+                child_threads.insert(next_child_id, spawn_execute(&program, fork_state));
+                next_child_id += 1;
+            }
+            OpCode::Join(tid) => {
+                let tid = state.get(tid)?;
+                let handle = child_threads
+                    .remove(&tid)
+                    .ok_or_eyre(format!("Attempt to join unknown thread: {tid}"))?;
+
+                match handle.await?? {
+                    ThreadResult::Exit(e) => return Ok(ThreadResult::Exit(e)),
+                    ThreadResult::Finish(v) => state.stack.push(v),
+                }
+            }
+            OpCode::ThreadFinish(v) => return Ok(ThreadResult::Finish(state.get(v)?)),
+
+            OpCode::Exit(code) => return Ok(ThreadResult::Exit(state.get(code)?)),
             OpCode::AssertEq(a, b) => {
                 let a = state.get(a)?;
                 let b = state.get(b)?;
@@ -236,10 +263,19 @@ async fn execute(program: &Program) -> eyre::Result<Word> {
         }
     }
 
-    Ok(0)
+    Ok(ThreadResult::Exit(0))
 }
 
-#[derive(Debug)]
+// TODO(shelbyd): Move to interface for simulation.
+fn spawn_execute(
+    program: &Arc<Program>,
+    state: ThreadState,
+) -> JoinHandle<eyre::Result<ThreadResult>> {
+    let program = Arc::clone(program);
+    tokio::task::spawn(async move { execute(program, state).await })
+}
+
+#[derive(Debug, Clone)]
 struct ThreadState {
     stack: Vec<Word>,
     memory: BTreeMap<Word, Word>,
@@ -302,4 +338,10 @@ impl ThreadState {
 
         Ok(())
     }
+}
+
+#[derive(Debug)]
+enum ThreadResult {
+    Exit(Word),
+    Finish(Word),
 }

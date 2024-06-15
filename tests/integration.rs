@@ -1,4 +1,4 @@
-use std::{ffi::OsStr, time::Instant};
+use std::{collections::BTreeSet, ffi::OsStr, time::Instant};
 
 use colored::Colorize;
 
@@ -18,7 +18,7 @@ async fn main() -> eyre::Result<()> {
         .filter(|f| f.file_type().is_file())
         .filter(|f| f.path().extension() == Some(OsStr::new("flasm")))
         .map(|f| f.path().to_owned())
-        .collect::<Vec<_>>();
+        .collect::<BTreeSet<_>>();
 
     let mut results = std::collections::BTreeMap::new();
 

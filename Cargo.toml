@@ -10,6 +10,7 @@ harness = false
 
 [dependencies]
 eyre = "0.6.12"
+futures = "0.3.30"
 log = "0.4.21"
 stderrlog = "0.6.0"
 structopt = "0.3.26"
