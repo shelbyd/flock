@@ -3,8 +3,10 @@ use std::path::Path;
 use eyre::{Context, OptionExt};
 
 pub type Word = u64;
+pub type Stack = Vec<Word>;
 
 pub async fn execute_at_path(path: &Path) -> eyre::Result<Word> {
+    // TODO(shelbyd): Catch panics?
     let contents = tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("Reading {}", path.display()))?;
@@ -21,13 +23,18 @@ fn parse(s: &str) -> eyre::Result<Program> {
         .filter(|s| !s.is_empty())
         .filter(|s| !s.starts_with("#"))
         .map(|line| {
-            let command = line.split_once(" ").map(|(c, _)| c).unwrap_or(line);
-            let args = line.split(" ").skip(1).collect::<Vec<_>>();
+            let (command, args) = match line.split_once(" ") {
+                None => (line, Vec::new()),
+                Some((command, args)) => (command, args.split(", ").collect()),
+            };
+
             Ok(match (command, &args[..]) {
                 ("PUSH", [v]) => OpCode::Push(v.parse()?),
-                ("ADD", []) => OpCode::Add,
-                ("DEBUG", []) => OpCode::Debug,
+                ("ADD", [a, b]) => OpCode::Add(a.parse()?, b.parse()?),
                 ("EXIT", [v]) => OpCode::Exit(v.parse()?),
+                ("ASSERT_EQ", [a, b]) => OpCode::AssertEq(a.parse()?, b.parse()?),
+
+                ("DEBUG", []) => OpCode::Debug,
 
                 _ => eyre::bail!("Could not parse command: {line:?}"),
             })
@@ -44,30 +51,73 @@ struct Program {
 
 #[derive(Debug)]
 enum OpCode {
-    Push(Word),
+    Push(ValSp),
 
-    Add,
+    Add(ValSp, ValSp),
 
-    Exit(Word),
+    Exit(ValSp),
+    AssertEq(ValSp, ValSp),
 
     Debug,
 }
 
-async fn execute(program: &Program) -> eyre::Result<Word> {
-    let mut stack = Vec::<Word>::new();
+#[derive(Debug)]
+enum ValSp {
+    // TODO(shelbyd): $peek
+    // TODO(shelbyd): Indexed pop, $pop[3]
+    Pop,
+    Literal(Word),
+}
 
-    let pop = |s: &mut Vec<Word>| s.pop().ok_or_eyre("Pop from empty stack");
+impl ValSp {
+    fn get(&self, stack: &mut Stack) -> eyre::Result<Word> {
+        match self {
+            ValSp::Pop => stack.pop().ok_or_eyre("Pop from empty stack"),
+            ValSp::Literal(v) => Ok(*v),
+        }
+    }
+}
+
+impl std::str::FromStr for ValSp {
+    type Err = eyre::Report;
+
+    fn from_str(s: &str) -> eyre::Result<ValSp> {
+        Ok(match s {
+            "$pop" => ValSp::Pop,
+            s => {
+                if let Ok(lit) = s.parse() {
+                    ValSp::Literal(lit)
+                } else {
+                    eyre::bail!("Could not parse as value specifier: {s:?}")
+                }
+            }
+        })
+    }
+}
+
+async fn execute(program: &Program) -> eyre::Result<Word> {
+    let mut stack: Stack = Vec::new();
 
     for op in &program.ops {
         match op {
-            OpCode::Push(w) => stack.push(*w),
-            OpCode::Add => {
-                let a = pop(&mut stack)?;
-                let b = pop(&mut stack)?;
+            OpCode::Push(v) => {
+                let v = v.get(&mut stack)?;
+                stack.push(v)
+            }
+            OpCode::Add(a, b) => {
+                let a = a.get(&mut stack)?;
+                let b = b.get(&mut stack)?;
                 stack.push(a + b);
             }
 
-            OpCode::Exit(code) => return Ok(*code),
+            OpCode::Exit(code) => return Ok(code.get(&mut stack)?),
+            OpCode::AssertEq(a, b) => {
+                let a = a.get(&mut stack)?;
+                let b = b.get(&mut stack)?;
+                if a != b {
+                    return Ok(1);
+                }
+            }
 
             OpCode::Debug => {
                 eprintln!("Stack");

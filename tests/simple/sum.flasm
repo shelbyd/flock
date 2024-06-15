@@ -1,4 +1,5 @@
 PUSH 3
 PUSH 5
-ADD
+ADD $pop, $pop
+
 ASSERT_EQ $pop, 8
