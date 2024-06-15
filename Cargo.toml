@@ -3,9 +3,19 @@ name = "flock"
 version = "0.1.0"
 edition = "2021"
 
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+harness = false
+
 [dependencies]
 eyre = "0.6.12"
 log = "0.4.21"
 stderrlog = "0.6.0"
 structopt = "0.3.26"
 tokio = { version = "1.38.0", features = ["full"] }
+
+[dev-dependencies]
+colored = "2.1.0"
+lazy_static = "1.4.0"
+walkdir = "2.5.0"
