@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 use eyre::{Context, OptionExt};
 
@@ -30,7 +30,11 @@ fn parse(s: &str) -> eyre::Result<Program> {
 
             Ok(match (command, &args[..]) {
                 ("PUSH", [v]) => OpCode::Push(v.parse()?),
+                ("STORE", [addr, v]) => OpCode::Store(addr.parse()?, v.parse()?),
+                ("LOAD", [addr]) => OpCode::Load(addr.parse()?),
+
                 ("ADD", [a, b]) => OpCode::Add(a.parse()?, b.parse()?),
+
                 ("EXIT", [v]) => OpCode::Exit(v.parse()?),
                 ("ASSERT_EQ", [a, b]) => OpCode::AssertEq(a.parse()?, b.parse()?),
 
@@ -52,6 +56,8 @@ struct Program {
 #[derive(Debug)]
 enum OpCode {
     Push(ValSp),
+    Store(ValSp, ValSp),
+    Load(ValSp),
 
     Add(ValSp, ValSp),
 
@@ -63,57 +69,78 @@ enum OpCode {
 
 #[derive(Debug)]
 enum ValSp {
-    // TODO(shelbyd): $peek
     // TODO(shelbyd): Indexed pop, $pop[3]
     Pop,
-    Literal(Word),
-}
+    Peek,
 
-impl ValSp {
-    fn get(&self, stack: &mut Stack) -> eyre::Result<Word> {
-        match self {
-            ValSp::Pop => stack.pop().ok_or_eyre("Pop from empty stack"),
-            ValSp::Literal(v) => Ok(*v),
-        }
-    }
+    Memory(Box<ValSp>),
+
+    Literal(Word),
 }
 
 impl std::str::FromStr for ValSp {
     type Err = eyre::Report;
 
     fn from_str(s: &str) -> eyre::Result<ValSp> {
-        Ok(match s {
-            "$pop" => ValSp::Pop,
-            s => {
-                if let Ok(lit) = s.parse() {
-                    ValSp::Literal(lit)
-                } else {
-                    eyre::bail!("Could not parse as value specifier: {s:?}")
-                }
-            }
-        })
+        if s == "$pop" {
+            return Ok(ValSp::Pop);
+        }
+
+        if s == "$peek" {
+            return Ok(ValSp::Peek);
+        }
+
+        if let Some(addr) = s.strip_prefix("$mem[").and_then(|s| s.strip_suffix("]")) {
+            return Ok(ValSp::Memory(Box::new(addr.parse()?)));
+        }
+
+        Ok(ValSp::Literal(parse_literal(s)?))
     }
 }
 
+fn parse_literal(s: &str) -> eyre::Result<Word> {
+    if let Some(hex) = s.strip_prefix("0x") {
+        let v = Word::from_str_radix(hex, 16).context(format!("Parsing as hex: {hex:?}"))?;
+        return Ok(v);
+    }
+
+    if let Ok(v) = s.parse() {
+        return Ok(v);
+    }
+
+    eyre::bail!("Could not parse as literal value: {s:?}")
+}
+
 async fn execute(program: &Program) -> eyre::Result<Word> {
-    let mut stack: Stack = Vec::new();
+    let mut state = State::new();
 
     for op in &program.ops {
         match op {
             OpCode::Push(v) => {
-                let v = v.get(&mut stack)?;
-                stack.push(v)
+                let v = state.get(v)?;
+                state.stack.push(v)
             }
-            OpCode::Add(a, b) => {
-                let a = a.get(&mut stack)?;
-                let b = b.get(&mut stack)?;
-                stack.push(a + b);
+            OpCode::Store(addr, v) => {
+                let addr = state.get(addr)?;
+                let v = state.get(v)?;
+                state.write_memory(addr, v)?;
+            }
+            OpCode::Load(addr) => {
+                let addr = state.get(addr)?;
+                let v = state.read_memory(addr)?;
+                state.stack.push(v);
             }
 
-            OpCode::Exit(code) => return Ok(code.get(&mut stack)?),
+            OpCode::Add(a, b) => {
+                let a = state.get(a)?;
+                let b = state.get(b)?;
+                state.stack.push(a + b);
+            }
+
+            OpCode::Exit(code) => return Ok(state.get(code)?),
             OpCode::AssertEq(a, b) => {
-                let a = a.get(&mut stack)?;
-                let b = b.get(&mut stack)?;
+                let a = state.get(a)?;
+                let b = state.get(b)?;
                 if a != b {
                     return Ok(1);
                 }
@@ -121,7 +148,7 @@ async fn execute(program: &Program) -> eyre::Result<Word> {
 
             OpCode::Debug => {
                 eprintln!("Stack");
-                for (i, w) in stack.iter().rev().enumerate() {
+                for (i, w) in state.stack.iter().rev().enumerate() {
                     eprintln!("{i}: {w}");
                 }
                 eprintln!("");
@@ -134,4 +161,56 @@ async fn execute(program: &Program) -> eyre::Result<Word> {
     }
 
     Ok(0)
+}
+
+#[derive(Debug)]
+struct State {
+    stack: Vec<Word>,
+    memory: BTreeMap<Word, Word>,
+}
+
+impl State {
+    fn new() -> Self {
+        State {
+            stack: Default::default(),
+            memory: Default::default(),
+        }
+    }
+
+    fn get(&mut self, val_sp: &ValSp) -> eyre::Result<Word> {
+        match val_sp {
+            ValSp::Literal(v) => Ok(*v),
+
+            ValSp::Pop => self.stack.pop().ok_or_eyre("Pop from empty stack"),
+            ValSp::Peek => self.stack.last().cloned().ok_or_eyre("Peek empty stack"),
+
+            ValSp::Memory(addr) => {
+                let addr = self.get(addr)?;
+                Ok(self.read_memory(addr)?)
+            }
+        }
+    }
+
+    fn read_memory(&self, addr: Word) -> eyre::Result<Word> {
+        let addr = self.aligned_local(addr)?;
+        Ok(*self.memory.get(&addr).unwrap_or(&0))
+    }
+
+    fn aligned_local(&self, addr: Word) -> eyre::Result<Word> {
+        const WORD_SIZE: Word = core::mem::size_of::<Word>() as Word;
+
+        eyre::ensure!(addr % WORD_SIZE == 0, "Misaligned address: 0x{addr:x}");
+        eyre::ensure!(
+            addr >> (WORD_SIZE * 8 - 1) == 0,
+            "Global addresses not supported yet: 0x{addr:x}"
+        );
+
+        Ok(addr / WORD_SIZE)
+    }
+
+    fn write_memory(&mut self, addr: Word, value: Word) -> eyre::Result<()> {
+        let addr = self.aligned_local(addr)?;
+        self.memory.insert(addr, value);
+        Ok(())
+    }
 }

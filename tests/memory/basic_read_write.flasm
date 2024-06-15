@@ -1,0 +1,9 @@
+ASSERT_EQ $mem[0x10], 0
+
+STORE 0x10, 42
+
+ASSERT_EQ $mem[0x10], 42
+
+LOAD 0x10
+ASSERT_EQ $peek, 42
+ASSERT_EQ $pop, 42
