@@ -5,10 +5,12 @@ use std::{
 };
 
 use eyre::{Context as _, OptionExt};
-use tokio::task::JoinHandle;
+use tokio::{sync::RwLock, task::JoinHandle};
 
 pub type Word = u64;
 pub type Stack = Vec<Word>;
+
+type Memory = BTreeMap<Word, Word>;
 
 pub async fn execute_at_path(path: &Path) -> eyre::Result<Word> {
     // TODO(shelbyd): Catch panics?
@@ -18,7 +20,7 @@ pub async fn execute_at_path(path: &Path) -> eyre::Result<Word> {
 
     let program = Arc::new(parse(&contents)?);
 
-    match execute(program, ThreadState::new()).await? {
+    match execute(program, ThreadState::new(), Default::default()).await? {
         ThreadResult::Exit(code) => Ok(code),
         ThreadResult::Finish(value) => Ok(value),
     }
@@ -116,10 +118,15 @@ fn parse_literal(s: &str) -> eyre::Result<Word> {
     eyre::bail!("Could not parse as literal value: {s:?}")
 }
 
-async fn execute(program: Arc<Program>, mut state: ThreadState) -> eyre::Result<ThreadResult> {
+async fn execute(
+    program: Arc<Program>,
+    mut state: ThreadState,
+    global_memory: Arc<RwLock<Memory>>,
+) -> eyre::Result<ThreadResult> {
     let mut ctx = Context {
         state: &mut state,
         program: &program,
+        global_memory,
         child_threads: HashMap::new(),
         next_child_id: 1,
     };
@@ -139,9 +146,11 @@ async fn execute(program: Arc<Program>, mut state: ThreadState) -> eyre::Result<
 fn spawn_execute(
     program: &Arc<Program>,
     state: ThreadState,
+    global_memory: &Arc<RwLock<Memory>>,
 ) -> JoinHandle<eyre::Result<ThreadResult>> {
     let program = Arc::clone(program);
-    tokio::task::spawn(async move { execute(program, state).await })
+    let global_memory = Arc::clone(global_memory);
+    tokio::task::spawn(async move { execute(program, state, global_memory).await })
 }
 
 #[derive(Debug, Clone)]
@@ -160,20 +169,6 @@ impl ThreadState {
         }
     }
 
-    fn get(&mut self, val_sp: &ValSp) -> eyre::Result<Word> {
-        match val_sp {
-            ValSp::Literal(v) => Ok(*v),
-
-            ValSp::Pop => self.stack.pop().ok_or_eyre("Pop from empty stack"),
-            ValSp::Peek => self.stack.last().cloned().ok_or_eyre("Peek empty stack"),
-
-            ValSp::Memory(addr) => {
-                let addr = self.get(addr)?;
-                Ok(self.read_memory(addr)?)
-            }
-        }
-    }
-
     fn push(&mut self, v: Word) {
         self.stack.push(v);
     }
@@ -188,8 +183,8 @@ impl ThreadState {
 
         eyre::ensure!(addr % WORD_SIZE == 0, "Misaligned address: 0x{addr:x}");
         eyre::ensure!(
-            addr >> (WORD_SIZE * 8 - 1) == 0,
-            "Global addresses not supported yet: 0x{addr:x}"
+            addr.leading_ones() == 0,
+            "Attempted to access global address in state: 0x{addr:x}"
         );
 
         Ok(addr / WORD_SIZE)
@@ -217,6 +212,71 @@ impl ThreadState {
 enum ThreadResult {
     Exit(Word),
     Finish(Word),
+}
+
+struct Context<'a> {
+    state: &'a mut ThreadState,
+    program: &'a Arc<Program>,
+    global_memory: Arc<RwLock<Memory>>,
+
+    child_threads: HashMap<Word, JoinHandle<eyre::Result<ThreadResult>>>,
+    next_child_id: Word,
+}
+
+impl Context<'_> {
+    async fn get(&mut self, val_sp: &ValSp) -> eyre::Result<Word> {
+        match val_sp {
+            ValSp::Literal(v) => Ok(*v),
+
+            ValSp::Pop => self.state.stack.pop().ok_or_eyre("Pop from empty stack"),
+            ValSp::Peek => self
+                .state
+                .stack
+                .last()
+                .cloned()
+                .ok_or_eyre("Peek empty stack"),
+
+            ValSp::Memory(addr) => {
+                let addr = Box::pin(self.get(addr)).await?;
+                Ok(self.read_memory(addr).await?)
+            }
+        }
+    }
+
+    async fn read_memory(&self, addr: Word) -> eyre::Result<Word> {
+        match self.aligned(addr)? {
+            Address::Local(a) => Ok(self.state.read_memory(a)?),
+            Address::Global(a) => Ok(*self.global_memory.read().await.get(&a).unwrap_or(&0)),
+        }
+    }
+
+    fn aligned(&self, addr: Word) -> eyre::Result<Address> {
+        const WORD_SIZE: Word = core::mem::size_of::<Word>() as Word;
+
+        eyre::ensure!(addr % WORD_SIZE == 0, "Misaligned address: 0x{addr:x}");
+
+        if addr >> (WORD_SIZE * 8 - 1) == 0 {
+            Ok(Address::Local(addr))
+        } else {
+            Ok(Address::Global(addr))
+        }
+    }
+
+    async fn write_memory(&mut self, addr: Word, val: Word) -> eyre::Result<()> {
+        match self.aligned(addr)? {
+            Address::Local(a) => Ok(self.state.write_memory(a, val)?),
+            Address::Global(a) => {
+                self.global_memory.write().await.insert(a, val);
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Hash, PartialEq, Eq, Clone, Copy, PartialOrd, Ord)]
+enum Address {
+    Local(Word),
+    Global(Word),
 }
 
 macro_rules! op_codes {
@@ -251,7 +311,7 @@ macro_rules! op_codes {
             async fn execute(&self, ctx: &mut Context<'_>) -> eyre::Result<Option<ThreadResult>> {
                 match self {
                     $(OpCode::$name { $($arg),* } => {
-                        $(let $arg = ctx.state.get($arg)?;)*
+                        $(let $arg = ctx.get($arg).await?;)*
                         let $ctx = ctx;
 
                         $body;
@@ -264,22 +324,15 @@ macro_rules! op_codes {
     };
 }
 
-struct Context<'a> {
-    state: &'a mut ThreadState,
-    program: &'a Arc<Program>,
-    child_threads: HashMap<Word, JoinHandle<eyre::Result<ThreadResult>>>,
-    next_child_id: Word,
-}
-
 op_codes!({
     PUSH => |ctx, v| {
         ctx.state.push(v);
     }
     STORE => |ctx, addr, v| {
-        ctx.state.write_memory(addr, v)?;
+        ctx.write_memory(addr, v).await?;
     }
     LOAD => |ctx, addr| {
-        let v = ctx.state.read_memory(addr)?;
+        let v = ctx.read_memory(addr).await?;
         ctx.state.push(v);
     }
 
@@ -310,7 +363,10 @@ op_codes!({
         // TODO(shelbyd): Global task id.
         ctx.state.push(ctx.next_child_id);
 
-        ctx.child_threads.insert(ctx.next_child_id, spawn_execute(&ctx.program, fork_state));
+        ctx.child_threads.insert(
+            ctx.next_child_id,
+            spawn_execute(&ctx.program, fork_state, &ctx.global_memory)
+        );
         ctx.next_child_id += 1;
     }
     JOIN => |ctx, tid| {
