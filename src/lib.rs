@@ -54,7 +54,7 @@ fn parse(s: &str) -> eyre::Result<Program> {
             Some((command, args)) => (command, args.split(", ").collect()),
         };
 
-        let op = parse_op(command, &args, &labels)?;
+        let op = OpCode::parse(command, &args, &labels)?;
         ops.push(op);
     }
 
@@ -127,7 +127,7 @@ async fn execute(program: Arc<Program>, mut state: ThreadState) -> eyre::Result<
     while let Some(op) = program.ops.get(ctx.state.instruction_pointer as usize) {
         ctx.state.instruction_pointer += 1;
 
-        if let Some(r) = execute_op(op, &mut ctx).await? {
+        if let Some(r) = op.execute(&mut ctx).await? {
             return Ok(r);
         }
     }
@@ -229,38 +229,37 @@ macro_rules! op_codes {
             }),*
         }
 
-        fn parse_op(command: &str, args: &[&str], labels: &HashMap<&str, u64>) -> eyre::Result<OpCode> {
-            match command {
-                $(stringify!($name) => {
-                    let mut args_iter = args.iter();
-                    let result = OpCode::$name {
-                        $($arg: ValSp::parse(
-                            args_iter.next().ok_or_eyre(format!("Too few arguments to {command}"))?,
-                            labels)?
-                        ),*
-                    };
-                    eyre::ensure!(args_iter.next().is_none(), "Too many arguments to {command}");
-                    Ok(result)
-                })*
+        impl OpCode {
+            fn parse(command: &str, args: &[&str], labels: &HashMap<&str, Word>) -> eyre::Result<OpCode> {
+                match command {
+                    $(stringify!($name) => {
+                        let mut args_iter = args.iter();
+                        let result = OpCode::$name {
+                            $($arg: ValSp::parse(
+                                args_iter.next().ok_or_eyre(format!("Too few arguments to {command}"))?,
+                                labels)?
+                            ),*
+                        };
+                        eyre::ensure!(args_iter.next().is_none(), "Too many arguments to {command}");
+                        Ok(result)
+                    })*
 
-                _ => eyre::bail!("Unknown command: {command}"),
-            }
-        }
-
-        async fn execute_op(op: &OpCode, ctx: &mut Context<'_>) -> eyre::Result<Option<ThreadResult>> {
-
-            match op {
-                $(OpCode::$name { $($arg),* } => {
-                    $(
-                        let $arg = ctx.state.get($arg)?;
-                    )*
-                    let $ctx = ctx;
-
-                    $body;
-                })*
+                    _ => eyre::bail!("Unknown command: {command}"),
+                }
             }
 
-            Ok(None)
+            async fn execute(&self, ctx: &mut Context<'_>) -> eyre::Result<Option<ThreadResult>> {
+                match self {
+                    $(OpCode::$name { $($arg),* } => {
+                        $(let $arg = ctx.state.get($arg)?;)*
+                        let $ctx = ctx;
+
+                        $body;
+                    })*
+                }
+
+                Ok(None)
+            }
         }
     };
 }
