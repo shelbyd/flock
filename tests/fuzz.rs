@@ -14,11 +14,22 @@ async fn main() -> eyre::Result<()> {
     eprintln!("");
 
     let fuzz = std::env::var("FUZZ");
-    let fuzz_for = match fuzz.as_ref().map(|s| s.as_str()) {
+    let mut fuzz_for = match fuzz.as_ref().map(|s| s.as_str()) {
         Ok("forever") => FuzzFor::Forever,
-        Ok(t) => FuzzFor::Duration(Duration::from_secs(t.parse()?)),
+        Ok("never") => FuzzFor::Never,
+        Ok(t) => {
+            if let Some(seconds) = t.strip_suffix("s") {
+                FuzzFor::Duration(Duration::from_secs(seconds.parse()?))
+            } else {
+                FuzzFor::Count(t.parse()?)
+            }
+        }
         Err(_) => FuzzFor::Never,
     };
+
+    if let FuzzFor::Never = &fuzz_for {
+        return Ok(());
+    }
 
     let programs = common::programs()?;
     let mut programs = programs.iter().cycle();
@@ -65,14 +76,22 @@ async fn main() -> eyre::Result<()> {
 enum FuzzFor {
     Forever,
     Duration(Duration),
+    Count(usize),
     Never,
 }
 
 impl FuzzFor {
-    fn should_run(&self, start: Instant) -> bool {
+    fn should_run(&mut self, start: Instant) -> bool {
         match self {
             FuzzFor::Forever => true,
             FuzzFor::Duration(d) => start.elapsed() < *d,
+            FuzzFor::Count(n) => {
+                if *n == 0 {
+                    return false;
+                }
+                *n -= 1;
+                true
+            }
             FuzzFor::Never => false,
         }
     }

@@ -1,0 +1,38 @@
+PUSH 1000 # Number of writing threads.
+
+:spawn
+JUMP_EQ $peek, 1, :write
+JUMP_EQ $peek, 0, :got_zero
+DIV $peek, 2
+SUB $pop[1], $peek
+
+FORK :new_thread
+NOP $pop[1]
+
+PUSH $pop[1]
+FORK :new_thread
+NOP $pop[1]
+
+JOIN $pop
+SHIFT_LEFT $peek, 8
+ASSERT_EQ $gmem[$pop], $pop
+
+JOIN $pop
+SHIFT_LEFT $peek, 8
+ASSERT_EQ $gmem[$pop], $pop
+
+EXIT 0
+
+:new_thread
+NOP $pop # Parent $tid
+NOP $pop[1] # Peer $tid or peer amount
+JUMP :spawn
+
+:write
+ASSERT_EQ $pop, 1
+SHIFT_LEFT $tid, 8
+STORE_GLOBAL $pop, $tid
+THREAD_FINISH $tid
+
+:got_zero
+EXIT 1

@@ -1,20 +1,19 @@
+mod spawner;
+
 use std::{
     collections::{BTreeMap, HashMap},
     ops::Deref,
     path::Path,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::Arc,
 };
 
 use eyre::{Context as _, OptionExt};
-use tokio::{
-    sync::{Mutex, RwLock},
-    task::JoinHandle,
-};
+use spawner::Spawner;
+use tokio::sync::{Mutex, RwLock};
 
 pub type Word = u64;
+const WORD_SIZE: Word = core::mem::size_of::<Word>() as Word;
+
 pub type Stack = Vec<Word>;
 
 type Memory = BTreeMap<Word, Word>;
@@ -22,51 +21,60 @@ type Memory = BTreeMap<Word, Word>;
 // What goes in Eal?
 //   - Network
 //   - Disk
+//   ? RwLock / Mutex
 /// External Abstraction Layer.
 #[async_trait::async_trait]
-pub trait Eal {}
+pub trait Eal: Send + Sync + 'static {}
 
 struct RealEal;
 
 impl Eal for RealEal {}
 
+struct HostCtx {
+    #[allow(unused)]
+    eal: Box<dyn Eal>,
+    spawner: Box<dyn Spawner>,
+    eprint: Mutex<()>,
+}
+
+impl HostCtx {
+    pub async fn execute(self: &Arc<Self>, program: Program) -> eyre::Result<Word> {
+        let process_ctx = Arc::new(ProcessCtx {
+            host: Arc::clone(self),
+            program,
+            global_memory: Default::default(),
+        });
+
+        let root_id = process_ctx.spawn(ThreadState::new()).await?;
+        match process_ctx.join(root_id).await? {
+            ThreadResult::Exit(code) => Ok(code),
+            ThreadResult::Finish(value) => Ok(value),
+        }
+    }
+}
+
 struct ProcessCtx {
+    host: Arc<HostCtx>,
     program: Program,
-    global_memory: Arc<RwLock<Memory>>,
-    local_threads: Arc<Mutex<HashMap<Word, JoinHandle<eyre::Result<ThreadResult>>>>>,
-    next_child_id: AtomicU64,
+    global_memory: RwLock<Memory>,
 }
 
 impl ProcessCtx {
     async fn spawn(self: &Arc<Self>, state: ThreadState) -> eyre::Result<Word> {
-        let thread_id = self.next_child_id.fetch_add(1, Ordering::Relaxed) as Word;
-
-        let thread_ctx = ThreadCtx {
-            id: thread_id,
-            proc: Arc::clone(self),
-            state,
-        };
-
-        self.local_threads
-            .lock()
-            .await
-            .insert(thread_id, spawn_execute(thread_ctx));
-        Ok(thread_id)
+        Ok(self.spawner.spawn(self, state).await?)
     }
 
     async fn join(&self, tid: Word) -> eyre::Result<ThreadResult> {
-        let handle = self
-            .local_threads
-            .lock()
-            .await
-            .remove(&tid)
-            .ok_or_eyre(format!("Joined unknown thread: {tid}"))?;
-        Ok(handle.await??)
+        Ok(self.spawner.join(tid).await?)
     }
 }
 
-fn spawn_execute(ctx: ThreadCtx) -> JoinHandle<Result<ThreadResult, eyre::Error>> {
-    tokio::task::spawn(async move { ctx.execute().await })
+impl Deref for ProcessCtx {
+    type Target = HostCtx;
+
+    fn deref(&self) -> &Self::Target {
+        &self.host
+    }
 }
 
 struct ThreadCtx {
@@ -77,7 +85,7 @@ struct ThreadCtx {
 
 impl ThreadCtx {
     async fn execute(mut self) -> eyre::Result<ThreadResult> {
-        // TODO(shelbyd): Should not have to clone.
+        // TODO(shelbyd): Do we have to clone?
         let proc = Arc::clone(&self.proc);
         let ops = &proc.program.ops;
 
@@ -99,6 +107,12 @@ impl ThreadCtx {
             ValSp::Literal(v) => Ok(*v),
 
             ValSp::Pop => self.state.stack.pop().ok_or_eyre("Pop from empty stack"),
+            ValSp::PopI(i) => {
+                let i = Box::pin(self.get(i)).await? as usize;
+                let index = self.state.stack.len() - i - 1;
+                Ok(self.state.stack.remove(index as usize))
+            }
+
             ValSp::Peek => self
                 .state
                 .stack
@@ -110,19 +124,26 @@ impl ThreadCtx {
                 let addr = Box::pin(self.get(addr)).await?;
                 Ok(self.read_memory(addr).await?)
             }
+            ValSp::GlobalMemory(addr) => {
+                let addr = Box::pin(self.get(addr)).await?;
+                Ok(self.read_memory(to_global(addr)).await?)
+            }
+
+            ValSp::ThreadId => Ok(self.id),
         }
     }
 
     async fn read_memory(&self, addr: Word) -> eyre::Result<Word> {
         match self.aligned(addr)? {
             Address::Local(a) => Ok(self.state.read_memory(a)?),
-            Address::Global(a) => Ok(*self.global_memory.read().await.get(&a).unwrap_or(&0)),
+            Address::Global(a) => {
+                let memory = &self.global_memory.read().await;
+                Ok(*memory.get(&a).unwrap_or(&0))
+            }
         }
     }
 
     fn aligned(&self, addr: Word) -> eyre::Result<Address> {
-        const WORD_SIZE: Word = core::mem::size_of::<Word>() as Word;
-
         eyre::ensure!(addr % WORD_SIZE == 0, "Misaligned address: 0x{addr:x}");
 
         if addr >> (WORD_SIZE * 8 - 1) == 0 {
@@ -143,6 +164,10 @@ impl ThreadCtx {
     }
 }
 
+fn to_global(addr: u64) -> u64 {
+    addr | (1 << (WORD_SIZE * 8 - 1))
+}
+
 impl Deref for ThreadCtx {
     type Target = ProcessCtx;
 
@@ -161,19 +186,14 @@ pub async fn execute_at_path(path: &Path) -> eyre::Result<Word> {
     execute_program(program, RealEal).await
 }
 
-pub async fn execute_program<E: Eal>(program: Program, _ext: E) -> eyre::Result<Word> {
-    let host_ctx = Arc::new(ProcessCtx {
-        program,
-        global_memory: Default::default(),
-        local_threads: Default::default(),
-        next_child_id: Default::default(),
+pub async fn execute_program<E: Eal>(program: Program, eal: E) -> eyre::Result<Word> {
+    let host = Arc::new(HostCtx {
+        eal: Box::new(eal),
+        spawner: Box::new(spawner::LocalSpawner::new()),
+        eprint: Default::default(),
     });
 
-    let root_id = host_ctx.spawn(ThreadState::new()).await?;
-    match host_ctx.join(root_id).await? {
-        ThreadResult::Exit(code) => Ok(code),
-        ThreadResult::Finish(value) => Ok(value),
-    }
+    Ok(host.execute(program).await?)
 }
 
 #[derive(Debug, Clone)]
@@ -185,9 +205,12 @@ impl Program {
     pub fn parse(s: &str) -> eyre::Result<Program> {
         let relevant_lines = s
             .lines()
+            .map(|s| match s.split_once("#") {
+                Some((pre, _)) => pre,
+                None => s,
+            })
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
-            .filter(|s| !s.starts_with("#"))
             .collect::<Vec<_>>();
 
         let mut ops_seen = 0;
@@ -222,13 +245,17 @@ impl Program {
 
 #[derive(Debug, Clone)]
 enum ValSp {
-    // TODO(shelbyd): Indexed pop, $pop[3]
+    Literal(Word),
+
     Pop,
+    PopI(Box<ValSp>),
+
     Peek,
 
     Memory(Box<ValSp>),
+    GlobalMemory(Box<ValSp>),
 
-    Literal(Word),
+    ThreadId,
 }
 
 impl ValSp {
@@ -241,16 +268,36 @@ impl ValSp {
             ));
         }
 
-        if s == "$pop" {
-            return Ok(ValSp::Pop);
+        let box_parse = |s| {
+            eyre::Ok(Box::new(
+                ValSp::parse(s, labels).context(format!("Parsing {s}"))?,
+            ))
+        };
+
+        match indexed_expr("$pop", s)? {
+            None => {}
+            Some(None) => return Ok(ValSp::Pop),
+            Some(Some(i)) => return Ok(ValSp::PopI(box_parse(i)?)),
         }
 
         if s == "$peek" {
             return Ok(ValSp::Peek);
         }
 
-        if let Some(addr) = s.strip_prefix("$mem[").and_then(|s| s.strip_suffix("]")) {
-            return Ok(ValSp::Memory(Box::new(ValSp::parse(addr, labels)?)));
+        match indexed_expr("$mem", s)? {
+            None => {}
+            Some(None) => eyre::bail!("$mem requires index"),
+            Some(Some(addr)) => return Ok(ValSp::Memory(box_parse(addr)?)),
+        }
+
+        match indexed_expr("$gmem", s)? {
+            None => {}
+            Some(None) => eyre::bail!("$gmem requires index"),
+            Some(Some(addr)) => return Ok(ValSp::GlobalMemory(box_parse(addr)?)),
+        }
+
+        if s == "$tid" {
+            return Ok(ValSp::ThreadId);
         }
 
         Ok(ValSp::Literal(parse_literal(s)?))
@@ -268,6 +315,29 @@ fn parse_literal(s: &str) -> eyre::Result<Word> {
     }
 
     eyre::bail!("Could not parse as literal value: {s:?}")
+}
+
+fn strip_square_braces(s: &str) -> eyre::Result<Option<&str>> {
+    let Some(without_first) = s.strip_prefix("[") else {
+        return Ok(None);
+    };
+
+    let result = without_first
+        .strip_suffix("]")
+        .ok_or_eyre(format!("Expected ']' at end of: {s}"))?;
+
+    Ok(Some(result))
+}
+
+fn indexed_expr<'s>(expr: &str, s: &'s str) -> eyre::Result<Option<Option<&'s str>>> {
+    let Some(with_expr) = s.strip_prefix(expr) else {
+        return Ok(None);
+    };
+
+    match strip_square_braces(with_expr)? {
+        None => return Ok(Some(None)),
+        Some(in_braces) => Ok(Some(Some(in_braces))),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -296,8 +366,6 @@ impl ThreadState {
     }
 
     fn aligned_local(&self, addr: Word) -> eyre::Result<Word> {
-        const WORD_SIZE: Word = core::mem::size_of::<Word>() as Word;
-
         eyre::ensure!(addr % WORD_SIZE == 0, "Misaligned address: 0x{addr:x}");
         eyre::ensure!(
             addr.leading_ones() == 0,
@@ -353,10 +421,10 @@ macro_rules! op_codes {
                     $(stringify!($name) => {
                         let mut args_iter = args.iter();
                         let result = OpCode::$name {
-                            $($arg: ValSp::parse(
-                                args_iter.next().ok_or_eyre(format!("Too few arguments to {command}"))?,
-                                labels)?
-                            ),*
+                            $($arg: {
+                                let arg = args_iter.next().ok_or_eyre(format!("Too few arguments to {command}"))?;
+                                ValSp::parse(arg, labels).context(format!("Parsing {arg}"))?
+                            }),*
                         };
                         eyre::ensure!(args_iter.next().is_none(), "Too many arguments to {command}");
                         Ok(result)
@@ -384,11 +452,16 @@ macro_rules! op_codes {
 
 // TODO(shelbyd): Proc macro on functions.
 op_codes!({
+    NOP => |_ctx, _v| {}
+
     PUSH => |ctx, v| {
         ctx.state.push(v);
     }
     STORE => |ctx, addr, v| {
         ctx.write_memory(addr, v).await?;
+    }
+    STORE_GLOBAL => |ctx, addr, v| {
+        ctx.write_memory(to_global(addr), v).await?;
     }
     LOAD => |ctx, addr| {
         let v = ctx.read_memory(addr).await?;
@@ -403,6 +476,13 @@ op_codes!({
     }
     MUL => |ctx, a, b| {
         ctx.state.push(a * b);
+    }
+    DIV => |ctx, a, b| {
+        ctx.state.push(a / b);
+    }
+
+    SHIFT_LEFT => |ctx, a, b| {
+        ctx.state.push(a << b);
     }
 
     JUMP => |ctx, addr| {
@@ -444,9 +524,11 @@ op_codes!({
     }
 
     DEBUG => |ctx, | {
+        let _eprint = ctx.eprint.lock().await;
+
         eprintln!("Stack");
         for (i, w) in ctx.state.stack.iter().rev().enumerate() {
-            eprintln!("{i}: {w}");
+            eprintln!("{i}: 0x{w:x} ({w})");
         }
         eprintln!("");
     }
