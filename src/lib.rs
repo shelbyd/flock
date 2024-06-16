@@ -12,63 +12,79 @@ pub type Stack = Vec<Word>;
 
 type Memory = BTreeMap<Word, Word>;
 
+// What goes in Eal?
+//   - Network
+//   - Disk
+/// External Abstraction Layer.
+#[async_trait::async_trait]
+pub trait Eal {}
+
+struct RealEal;
+
+impl Eal for RealEal {}
+
 pub async fn execute_at_path(path: &Path) -> eyre::Result<Word> {
     // TODO(shelbyd): Catch panics?
     let contents = tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("Reading {}", path.display()))?;
 
-    let program = Arc::new(parse(&contents)?);
+    let program = Program::parse(&contents)?;
+    execute_program(program, RealEal).await
+}
 
-    match execute(program, ThreadState::new(), Default::default()).await? {
+pub async fn execute_program<E: Eal>(program: Program, _ext: E) -> eyre::Result<Word> {
+    match execute(Arc::new(program), ThreadState::new(), Default::default()).await? {
         ThreadResult::Exit(code) => Ok(code),
         ThreadResult::Finish(value) => Ok(value),
     }
 }
 
-fn parse(s: &str) -> eyre::Result<Program> {
-    let relevant_lines = s
-        .lines()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .filter(|s| !s.starts_with("#"))
-        .collect::<Vec<_>>();
-
-    let mut ops_seen = 0;
-    let mut labels = HashMap::new();
-    for line in &relevant_lines {
-        if let Some(label) = line.strip_prefix(":") {
-            let existing = labels.insert(label, ops_seen);
-            eyre::ensure!(existing.is_none(), "Duplicate label: {label}");
-        } else {
-            ops_seen += 1;
-        }
-    }
-
-    let mut ops = Vec::new();
-    for line in relevant_lines {
-        if line.starts_with(":") {
-            continue;
-        }
-
-        let (command, args) = match line.split_once(" ") {
-            None => (line, Vec::new()),
-            Some((command, args)) => (command, args.split(", ").collect()),
-        };
-
-        let op = OpCode::parse(command, &args, &labels)?;
-        ops.push(op);
-    }
-
-    Ok(Program { ops })
-}
-
-#[derive(Debug)]
-struct Program {
+#[derive(Debug, Clone)]
+pub struct Program {
     ops: Vec<OpCode>,
 }
 
-#[derive(Debug)]
+impl Program {
+    pub fn parse(s: &str) -> eyre::Result<Program> {
+        let relevant_lines = s
+            .lines()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .filter(|s| !s.starts_with("#"))
+            .collect::<Vec<_>>();
+
+        let mut ops_seen = 0;
+        let mut labels = HashMap::new();
+        for line in &relevant_lines {
+            if let Some(label) = line.strip_prefix(":") {
+                let existing = labels.insert(label, ops_seen);
+                eyre::ensure!(existing.is_none(), "Duplicate label: {label}");
+            } else {
+                ops_seen += 1;
+            }
+        }
+
+        let mut ops = Vec::new();
+        for line in relevant_lines {
+            if line.starts_with(":") {
+                continue;
+            }
+
+            let (command, args) = match line.split_once(" ") {
+                None => (line, Vec::new()),
+                Some((command, args)) => (command, args.split(", ").collect()),
+            };
+
+            let op = OpCode::parse(command, &args, &labels)?;
+            ops.push(op);
+        }
+
+        Ok(Program { ops })
+    }
+}
+
+#[derive(Debug, Clone)]
 enum ValSp {
     // TODO(shelbyd): Indexed pop, $pop[3]
     Pop,
@@ -282,7 +298,7 @@ enum Address {
 macro_rules! op_codes {
     ({$($name: ident => |$ctx:ident, $($arg:ident),*| $body:tt)*}) => {
         #[allow(non_camel_case_types)]
-        #[derive(Debug)]
+        #[derive(Debug, Clone)]
         enum OpCode {
             $($name {
                 $($arg: ValSp),*

@@ -1,6 +1,8 @@
-use std::{collections::BTreeSet, ffi::OsStr, time::Instant};
+use std::time::Instant;
 
 use colored::Colorize;
+
+mod common;
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
@@ -11,18 +13,9 @@ async fn main() -> eyre::Result<()> {
     let ok = "ok".green();
     let failed = "FAILED".red();
 
-    let files = walkdir::WalkDir::new("tests")
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .filter(|f| f.file_type().is_file())
-        .filter(|f| f.path().extension() == Some(OsStr::new("flasm")))
-        .map(|f| f.path().to_owned())
-        .collect::<BTreeSet<_>>();
-
     let mut results = std::collections::BTreeMap::new();
 
-    for file in files {
+    for file in common::files()? {
         eprint!("test {} ... ", file.display());
 
         let result = flock::execute_at_path(&file).await;
