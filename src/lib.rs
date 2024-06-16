@@ -4,7 +4,7 @@ use std::{
     sync::Arc,
 };
 
-use eyre::{Context, OptionExt};
+use eyre::{Context as _, OptionExt};
 use tokio::task::JoinHandle;
 
 pub type Word = u64;
@@ -43,8 +43,6 @@ fn parse(s: &str) -> eyre::Result<Program> {
         }
     }
 
-    let parse = |s: &str| ValSp::parse(s, &labels);
-
     let mut ops = Vec::new();
     for line in relevant_lines {
         if line.starts_with(":") {
@@ -56,29 +54,7 @@ fn parse(s: &str) -> eyre::Result<Program> {
             Some((command, args)) => (command, args.split(", ").collect()),
         };
 
-        let op = match (command, &args[..]) {
-            ("PUSH", [v]) => OpCode::Push(parse(v)?),
-            ("STORE", [addr, v]) => OpCode::Store(parse(addr)?, parse(v)?),
-            ("LOAD", [addr]) => OpCode::Load(parse(addr)?),
-
-            ("ADD", [a, b]) => OpCode::Add(parse(a)?, parse(b)?),
-            ("SUB", [a, b]) => OpCode::Sub(parse(a)?, parse(b)?),
-            ("MUL", [a, b]) => OpCode::Mul(parse(a)?, parse(b)?),
-
-            ("JUMP", [addr]) => OpCode::Jump(parse(addr)?),
-            ("JUMP_EQ", [a, b, addr]) => OpCode::JumpEq(parse(a)?, parse(b)?, parse(addr)?),
-
-            ("FORK", [addr]) => OpCode::Fork(parse(addr)?),
-            ("JOIN", [id]) => OpCode::Join(parse(id)?),
-            ("THREAD_FINISH", [v]) => OpCode::ThreadFinish(parse(v)?),
-
-            ("EXIT", [v]) => OpCode::Exit(parse(v)?),
-            ("ASSERT_EQ", [a, b]) => OpCode::AssertEq(parse(a)?, parse(b)?),
-
-            ("DEBUG", []) => OpCode::Debug,
-
-            _ => eyre::bail!("Could not parse command: {line:?}"),
-        };
+        let op = parse_op(command, &args, &labels)?;
         ops.push(op);
     }
 
@@ -88,29 +64,6 @@ fn parse(s: &str) -> eyre::Result<Program> {
 #[derive(Debug)]
 struct Program {
     ops: Vec<OpCode>,
-}
-
-#[derive(Debug)]
-enum OpCode {
-    Push(ValSp),
-    Store(ValSp, ValSp),
-    Load(ValSp),
-
-    Add(ValSp, ValSp),
-    Sub(ValSp, ValSp),
-    Mul(ValSp, ValSp),
-
-    Jump(ValSp),
-    JumpEq(ValSp, ValSp, ValSp),
-
-    Fork(ValSp),
-    Join(ValSp),
-    ThreadFinish(ValSp),
-
-    Exit(ValSp),
-    AssertEq(ValSp, ValSp),
-
-    Debug,
 }
 
 #[derive(Debug)]
@@ -164,103 +117,18 @@ fn parse_literal(s: &str) -> eyre::Result<Word> {
 }
 
 async fn execute(program: Arc<Program>, mut state: ThreadState) -> eyre::Result<ThreadResult> {
-    let mut child_threads = HashMap::new();
-    let mut next_child_id = 1;
+    let mut ctx = Context {
+        state: &mut state,
+        program: &program,
+        child_threads: HashMap::new(),
+        next_child_id: 1,
+    };
 
-    while let Some(op) = program.ops.get(state.instruction_pointer as usize) {
-        state.instruction_pointer += 1;
+    while let Some(op) = program.ops.get(ctx.state.instruction_pointer as usize) {
+        ctx.state.instruction_pointer += 1;
 
-        match op {
-            OpCode::Push(v) => {
-                let v = state.get(v)?;
-                state.push(v)
-            }
-            OpCode::Store(addr, v) => {
-                let addr = state.get(addr)?;
-                let v = state.get(v)?;
-                state.write_memory(addr, v)?;
-            }
-            OpCode::Load(addr) => {
-                let addr = state.get(addr)?;
-                let v = state.read_memory(addr)?;
-                state.push(v);
-            }
-
-            OpCode::Add(a, b) => {
-                let a = state.get(a)?;
-                let b = state.get(b)?;
-                state.push(a + b);
-            }
-            OpCode::Sub(a, b) => {
-                let a = state.get(a)?;
-                let b = state.get(b)?;
-                state.push(a - b);
-            }
-            OpCode::Mul(a, b) => {
-                let a = state.get(a)?;
-                let b = state.get(b)?;
-                state.push(a * b);
-            }
-
-            OpCode::Jump(addr) => {
-                let addr = state.get(addr)?;
-                state.jump_to(addr, &program)?;
-            }
-            OpCode::JumpEq(a, b, addr) => {
-                let a = state.get(a)?;
-                let b = state.get(b)?;
-                let addr = state.get(addr)?;
-
-                if a == b {
-                    state.jump_to(addr, &program)?;
-                }
-            }
-
-            OpCode::Fork(addr) => {
-                let addr = state.get(addr)?;
-
-                let mut fork_state = state.clone();
-                fork_state.jump_to(addr, &program)?;
-                fork_state.push(0);
-
-                // TODO(shelbyd): Global task id.
-                state.push(next_child_id);
-
-                child_threads.insert(next_child_id, spawn_execute(&program, fork_state));
-                next_child_id += 1;
-            }
-            OpCode::Join(tid) => {
-                let tid = state.get(tid)?;
-                let handle = child_threads
-                    .remove(&tid)
-                    .ok_or_eyre(format!("Attempt to join unknown thread: {tid}"))?;
-
-                match handle.await?? {
-                    // TODO(shelbyd): Exit from child thread without join.
-                    ThreadResult::Exit(e) => return Ok(ThreadResult::Exit(e)),
-                    ThreadResult::Finish(v) => state.push(v),
-                }
-            }
-            OpCode::ThreadFinish(v) => return Ok(ThreadResult::Finish(state.get(v)?)),
-
-            OpCode::Exit(code) => return Ok(ThreadResult::Exit(state.get(code)?)),
-            OpCode::AssertEq(a, b) => {
-                let a = state.get(a)?;
-                let b = state.get(b)?;
-                eyre::ensure!(a == b, "Expected {a} to equal {b}");
-            }
-
-            OpCode::Debug => {
-                eprintln!("Stack");
-                for (i, w) in state.stack.iter().rev().enumerate() {
-                    eprintln!("{i}: {w}");
-                }
-                eprintln!("");
-            }
-
-            #[cfg(debug_assertions)]
-            #[allow(unreachable_patterns)]
-            _ => todo!("{op:?}"),
+        if let Some(r) = execute_op(op, &mut ctx).await? {
+            return Ok(r);
         }
     }
 
@@ -350,3 +218,129 @@ enum ThreadResult {
     Exit(Word),
     Finish(Word),
 }
+
+macro_rules! op_codes {
+    ({$($name: ident => |$ctx:ident, $($arg:ident),*| $body:tt)*}) => {
+        #[allow(non_camel_case_types)]
+        #[derive(Debug)]
+        enum OpCode {
+            $($name {
+                $($arg: ValSp),*
+            }),*
+        }
+
+        fn parse_op(command: &str, args: &[&str], labels: &HashMap<&str, u64>) -> eyre::Result<OpCode> {
+            match command {
+                $(stringify!($name) => {
+                    let mut args_iter = args.iter();
+                    let result = OpCode::$name {
+                        $($arg: ValSp::parse(
+                            args_iter.next().ok_or_eyre(format!("Too few arguments to {command}"))?,
+                            labels)?
+                        ),*
+                    };
+                    eyre::ensure!(args_iter.next().is_none(), "Too many arguments to {command}");
+                    Ok(result)
+                })*
+
+                _ => eyre::bail!("Unknown command: {command}"),
+            }
+        }
+
+        async fn execute_op(op: &OpCode, ctx: &mut Context<'_>) -> eyre::Result<Option<ThreadResult>> {
+
+            match op {
+                $(OpCode::$name { $($arg),* } => {
+                    $(
+                        let $arg = ctx.state.get($arg)?;
+                    )*
+                    let $ctx = ctx;
+
+                    $body;
+                })*
+            }
+
+            Ok(None)
+        }
+    };
+}
+
+struct Context<'a> {
+    state: &'a mut ThreadState,
+    program: &'a Arc<Program>,
+    child_threads: HashMap<Word, JoinHandle<eyre::Result<ThreadResult>>>,
+    next_child_id: Word,
+}
+
+op_codes!({
+    PUSH => |ctx, v| {
+        ctx.state.push(v);
+    }
+    STORE => |ctx, addr, v| {
+        ctx.state.write_memory(addr, v)?;
+    }
+    LOAD => |ctx, addr| {
+        let v = ctx.state.read_memory(addr)?;
+        ctx.state.push(v);
+    }
+
+    ADD => |ctx, a, b| {
+        ctx.state.push(a + b);
+    }
+    SUB => |ctx, a, b| {
+        ctx.state.push(a - b);
+    }
+    MUL => |ctx, a, b| {
+        ctx.state.push(a * b);
+    }
+
+    JUMP => |ctx, addr| {
+        ctx.state.jump_to(addr, ctx.program)?;
+    }
+    JUMP_EQ => |ctx, a, b, addr| {
+        if a == b {
+            ctx.state.jump_to(addr, ctx.program)?;
+        }
+    }
+
+    FORK => |ctx, addr| {
+        let mut fork_state = ctx.state.clone();
+        fork_state.jump_to(addr, &ctx.program)?;
+        fork_state.push(0);
+
+        // TODO(shelbyd): Global task id.
+        ctx.state.push(ctx.next_child_id);
+
+        ctx.child_threads.insert(ctx.next_child_id, spawn_execute(&ctx.program, fork_state));
+        ctx.next_child_id += 1;
+    }
+    JOIN => |ctx, tid| {
+        let handle = ctx.child_threads
+            .remove(&tid)
+            .ok_or_eyre(format!("Attempt to join unknown thread: {tid}"))?;
+
+        match handle.await?? {
+            // TODO(shelbyd): Exit from child thread without join.
+            ThreadResult::Exit(e) => return Ok(Some(ThreadResult::Exit(e))),
+            ThreadResult::Finish(v) => ctx.state.push(v),
+        }
+    }
+    THREAD_FINISH => |_ctx, v| {
+        return Ok(Some(ThreadResult::Finish(v)));
+    }
+
+    EXIT => |_ctx, v| {
+        return Ok(Some(ThreadResult::Exit(v)));
+    }
+    ASSERT_EQ => |_ctx, a, b| {
+        eyre::ensure!(a == b, "Expected {a} to equal {b}");
+    }
+
+    DEBUG => |ctx, | {
+        eprintln!("Stack");
+        for (i, w) in ctx.state.stack.iter().rev().enumerate() {
+            eprintln!("{i}: {w}");
+        }
+        eprintln!("");
+    }
+});
