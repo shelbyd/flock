@@ -9,47 +9,63 @@ use std::{
 use eyre::OptionExt;
 use tokio::{sync::Mutex, task::JoinHandle};
 
-use crate::{ProcessCtx, ThreadCtx, ThreadResult, ThreadState, Word};
+use crate::{
+    rand::Rand,
+    remote::{Message, Peers},
+    ProcessCtx, ThreadCtx, ThreadResult, ThreadState, Word,
+};
 
-#[async_trait::async_trait]
-pub(crate) trait Spawner: Send + Sync + 'static {
-    async fn spawn(&self, process: &Arc<ProcessCtx>, state: ThreadState) -> eyre::Result<Word>;
-    async fn join(&self, tid: Word) -> eyre::Result<ThreadResult>;
+pub(crate) struct Spawner {
+    rand: Rand,
+    spawn_count: AtomicU64,
+    threads: Mutex<HashMap<Word, JoinHandle<eyre::Result<ThreadResult>>>>,
+    peers: Arc<Peers>,
 }
 
-#[derive(Default)]
-pub(crate) struct LocalSpawner {
-    next_child_id: AtomicU64,
-    local_threads: Mutex<HashMap<Word, JoinHandle<eyre::Result<ThreadResult>>>>,
-}
-
-impl LocalSpawner {
-    pub(crate) fn new() -> LocalSpawner {
-        LocalSpawner::default()
+impl Spawner {
+    pub(crate) fn new(rand: Rand, peers: Arc<Peers>) -> Spawner {
+        Spawner {
+            rand,
+            spawn_count: Default::default(),
+            threads: Default::default(),
+            peers,
+        }
     }
-}
 
-#[async_trait::async_trait]
-impl Spawner for LocalSpawner {
-    async fn spawn(&self, process: &Arc<ProcessCtx>, state: ThreadState) -> eyre::Result<Word> {
-        let thread_id = self.next_child_id.fetch_add(1, Ordering::Relaxed) as Word;
+    pub(crate) async fn spawn(
+        &self,
+        process: &Arc<ProcessCtx>,
+        state: ThreadState,
+    ) -> eyre::Result<Word> {
+        let thread_id = self
+            .rand
+            .get("thread_id")
+            .get(self.spawn_count.fetch_add(1, Ordering::Relaxed).to_string())
+            .word();
 
-        let thread_ctx = ThreadCtx {
+        let context = ThreadCtx {
             id: thread_id,
             proc: Arc::clone(process),
             state,
         };
 
-        self.local_threads
-            .lock()
-            .await
-            .insert(thread_id, spawn_execute(thread_ctx));
+        let locations = self.peers.len() + 1;
+        match (thread_id as usize) % locations {
+            0 => {
+                self.threads
+                    .lock()
+                    .await
+                    .insert(thread_id, spawn_execute(context));
+            }
+            peer => self.peers[peer - 1].send_message(Message::Spawn { context })?,
+        }
+
         Ok(thread_id)
     }
 
-    async fn join(&self, tid: Word) -> eyre::Result<ThreadResult> {
+    pub(crate) async fn join(&self, tid: Word) -> eyre::Result<ThreadResult> {
         let handle = {
-            let mut threads = self.local_threads.lock().await;
+            let mut threads = self.threads.lock().await;
             threads
                 .remove(&tid)
                 .ok_or_eyre(format!("Joined unknown thread: {tid}"))?

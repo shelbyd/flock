@@ -5,7 +5,8 @@ use std::{
 
 use colored::Colorize;
 use eyre::Context;
-use flock::execute_program;
+
+use crate::common::execute_program_with_seed;
 
 mod common;
 
@@ -40,9 +41,8 @@ async fn main() -> eyre::Result<()> {
     while fuzz_for.should_run(start) {
         let seed: u64 = rand::random();
 
-        let eal = common::random_eal(seed);
         let (path, program) = programs.next().unwrap();
-        let failed = match execute_program(program.clone(), eal).await {
+        let failed = match execute_program_with_seed(program.clone(), seed).await {
             Ok(0) => {
                 passed += 1;
                 continue;

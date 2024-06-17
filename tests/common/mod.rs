@@ -1,7 +1,5 @@
 #![allow(unused)]
 
-mod rand;
-
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
@@ -9,9 +7,7 @@ use std::{
 };
 
 use eyre::Context;
-use flock::{Eal, Program};
-
-use self::rand::ConsistentRand;
+use flock::{rand::Rand, spawn_host, Eal, Program, Word};
 
 pub fn files() -> eyre::Result<BTreeSet<PathBuf>> {
     Ok(walkdir::WalkDir::new("tests")
@@ -35,14 +31,28 @@ pub fn programs() -> eyre::Result<BTreeMap<PathBuf, Program>> {
         .collect()
 }
 
-pub fn random_eal(seed: u64) -> RandomVm {
-    let rand = ConsistentRand::new(seed);
-    let host_processes = (rand.get("host_processes").poisson(3.0) as usize).max(1);
-
-    RandomVm {}
+pub struct RandomVm {
+    rand: Rand,
 }
 
-pub struct RandomVm {}
-
 #[async_trait::async_trait]
-impl Eal for RandomVm {}
+impl Eal for RandomVm {
+    fn rand(&self) -> Rand {
+        self.rand.get("for_eal")
+    }
+}
+
+pub async fn execute_program_with_seed(program: Program, seed: u64) -> eyre::Result<Word> {
+    let rand = Rand::new(seed);
+    let node_count = (rand.get("host_processes").poisson(3.0) as usize).max(1);
+
+    let nodes = futures::future::try_join_all((0..node_count).map(|i| {
+        spawn_host(RandomVm {
+            rand: rand.get(i.to_string()),
+        })
+    }))
+    .await?;
+
+    let node = rand.get("root_node").select(&nodes).unwrap();
+    Ok(node.execute(program).await?)
+}

@@ -1,3 +1,6 @@
+mod event;
+pub mod rand;
+mod remote;
 mod spawner;
 
 use std::{
@@ -7,9 +10,15 @@ use std::{
     sync::Arc,
 };
 
+use event::EventListener;
 use eyre::{Context as _, OptionExt};
+use rand::Rand;
+use remote::Peers;
 use spawner::Spawner;
-use tokio::sync::{Mutex, RwLock};
+use tokio::{
+    sync::{broadcast, Mutex, RwLock},
+    task::JoinSet,
+};
 
 pub type Word = u64;
 const WORD_SIZE: Word = core::mem::size_of::<Word>() as Word;
@@ -24,17 +33,24 @@ type Memory = BTreeMap<Word, Word>;
 //   ? RwLock / Mutex
 /// External Abstraction Layer.
 #[async_trait::async_trait]
-pub trait Eal: Send + Sync + 'static {}
+pub trait Eal: Send + Sync + 'static {
+    fn rand(&self) -> Rand;
+}
 
 struct RealEal;
 
-impl Eal for RealEal {}
+impl Eal for RealEal {
+    fn rand(&self) -> Rand {
+        Rand::new(::rand::random())
+    }
+}
 
-struct HostCtx {
+pub struct HostCtx {
     #[allow(unused)]
     eal: Box<dyn Eal>,
-    spawner: Box<dyn Spawner>,
+    spawner: Spawner,
     eprint: Mutex<()>,
+    peers: Arc<Peers>,
 }
 
 impl HostCtx {
@@ -50,6 +66,25 @@ impl HostCtx {
             ThreadResult::Exit(code) => Ok(code),
             ThreadResult::Finish(value) => Ok(value),
         }
+    }
+
+    fn spawn_tasks(self: &Arc<Self>) {
+        let mut join_set = JoinSet::new();
+        let (sender, _) = broadcast::channel(64);
+
+        self.peers.spawn_listener(&mut join_set, sender.subscribe());
+
+        tokio::task::spawn(async move {
+            while let Some(r) = join_set.join_next().await {
+                match r {
+                    Ok(Ok(())) => {}
+
+                    Ok(Err(_)) | Err(_) => {
+                        std::process::exit(1);
+                    }
+                }
+            }
+        });
     }
 }
 
@@ -183,17 +218,25 @@ pub async fn execute_at_path(path: &Path) -> eyre::Result<Word> {
         .with_context(|| format!("Reading {}", path.display()))?;
 
     let program = Program::parse(&contents)?;
-    execute_program(program, RealEal).await
+
+    let host = spawn_host(RealEal).await?;
+    Ok(host.execute(program).await?)
 }
 
-pub async fn execute_program<E: Eal>(program: Program, eal: E) -> eyre::Result<Word> {
+pub async fn spawn_host<E: Eal>(eal: E) -> eyre::Result<Arc<HostCtx>> {
+    let rand = eal.rand();
+
+    let peers = Arc::new(Peers::new());
+
     let host = Arc::new(HostCtx {
         eal: Box::new(eal),
-        spawner: Box::new(spawner::LocalSpawner::new()),
+        spawner: spawner::Spawner::new(rand, Arc::clone(&peers)),
         eprint: Default::default(),
+        peers,
     });
+    host.spawn_tasks();
 
-    Ok(host.execute(program).await?)
+    Ok(host)
 }
 
 #[derive(Debug, Clone)]
